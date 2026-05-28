@@ -1,5 +1,5 @@
-def calculate_sum(numbers):
+def sum_numbers(numbers):
     return sum(numbers)
 
-result = calculate_sum([1, 2, 3, 4, 5])
+result = sum_numbers([1, 2, 3, 4, 5])
 print(result)

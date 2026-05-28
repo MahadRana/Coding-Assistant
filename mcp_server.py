@@ -3,10 +3,18 @@ from pathlib import Path
 import subprocess
 import tempfile
 import os
+from langchain_community.tools.tavily_search import TavilySearchResults
 
 
 
 mcp = FastMCP("Tools")
+
+@mcp.tool()
+def search_web(query:str) -> str:
+    """Search Web for information"""
+    search = TavilySearchResults(max_results=3)
+    results = search.invoke(query)
+    return str(results)
 
 @mcp.tool()
 def run_code(file_path:str):
