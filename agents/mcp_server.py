@@ -1,25 +1,23 @@
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
 import subprocess
-import tempfile
-import os
-from langchain_community.tools.tavily_search import TavilySearchResults
-
+import sys
+from langchain_tavily import TavilySearch
 
 
 mcp = FastMCP("Tools")
+_tavily = TavilySearch(max_results=3)
 
 @mcp.tool()
 def search_web(query:str) -> str:
     """Search Web for information"""
-    search = TavilySearchResults(max_results=3)
-    results = search.invoke(query)
+    results = _tavily.invoke(query)
     return str(results)
 
 @mcp.tool()
 def run_code(file_path:str):
     try:
-        process = subprocess.run(["python", file_path], capture_output=True, text=True, timeout=10)
+        process = subprocess.run([sys.executable, file_path], capture_output=True, text=True, timeout=10)
         if process.returncode == 0:
             return {"success":True, "output":str(process.stdout)}
         else:
@@ -44,6 +42,7 @@ def read_file(file_path:str):
 @mcp.tool()
 def write_file(file_path:str, content:str):
     try:
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w") as file:
             file.write(content)
             return {"success":True}
@@ -51,9 +50,9 @@ def write_file(file_path:str, content:str):
         return {"success":False, "error": str(e)}
 
 @mcp.tool()
-def list_files(dir:str):
+def list_files(directory: str):
     try:
-        path = Path(dir)
+        path = Path(directory)
         files = [str(f) for f in path.iterdir() if f.is_file()]
         return {"success":True, "files":files}
     except Exception as e:
