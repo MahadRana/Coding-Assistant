@@ -17,7 +17,8 @@ def search_web(query:str) -> str:
 @mcp.tool()
 def run_code(file_path:str):
     try:
-        process = subprocess.run([sys.executable, file_path], capture_output=True, text=True, timeout=10)
+        p = Path(file_path)
+        process = subprocess.run([sys.executable, p.name], capture_output=True, text=True, timeout=10, cwd=str(p.parent))
         if process.returncode == 0:
             return {"success":True, "output":str(process.stdout)}
         else:
@@ -40,12 +41,13 @@ def read_file(file_path:str):
 
 
 @mcp.tool()
-def write_file(file_path:str, content:str):
+def write_files(files:dict):
     try:
-        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, "w") as file:
-            file.write(content)
-            return {"success":True}
+        for file_path, content in files.items():
+            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, "w") as file:
+                file.write(content)
+        return {"success":True}
     except Exception as e:
         return {"success":False, "error": str(e)}
 
@@ -57,6 +59,21 @@ def list_files(directory: str):
         return {"success":True, "files":files}
     except Exception as e:
         return {"success":False, "error": str(e)}
+
+@mcp.tool()
+def install_deps(packages: list):
+    try:
+        process = subprocess.run(
+            [sys.executable, "-m", "pip", "install", *packages],
+            capture_output=True, text=True, timeout=120
+        )
+        if process.returncode == 0:
+            return {"success": True}
+        return {"success": False, "error": process.stderr}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "pip install timed out"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
