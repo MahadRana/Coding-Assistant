@@ -1,0 +1,17 @@
+meta {
+  name: run
+  type: http
+  seq: 1
+}
+
+post {
+  url: http://localhost:8000/run
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "task": "Write a Python script that prints hello world"
+  }
+}

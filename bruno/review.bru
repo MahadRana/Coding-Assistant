@@ -1,0 +1,19 @@
+meta {
+  name: review
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://localhost:8000/review
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "thread_id": "<thread_id from /run response>",
+    "action": "reject",
+    "feedback": "Use httpx instead of requests, and add a CLI flag for currency."
+  }
+}

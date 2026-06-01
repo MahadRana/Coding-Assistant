@@ -1,17 +1,22 @@
 import json
+import logging
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.graph import MessagesState
 from datetime import datetime
+from langgraph.types import interrupt
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 llm = ChatAnthropic(model="claude-sonnet-4-6")
 
 
 class State(MessagesState):
     task: str = ""
+    plan_decision: str = ""
     workspace: str = ""
     dependencies: list[str] = []
     steps: str = ""
@@ -68,16 +73,18 @@ _DEBUGGER_PROMPT = """\
 You are a debugger. Fix the issue below so the code runs correctly.
 
 Error: {error}
+Entry point: {file_path}
+All project files: {files}
 Workspace: {workspace}
 
 Rules:
-- Extract the file_path from the error
-- Read the file first using read_file
-- Code must compile
-- Make the minimal changes needed to fix the error — do not change the overall goal
-- Write the corrected code back to the same file path using write_files
-- Call write_files with: {{"{workspace}/broken_file.py": "corrected code here"}}
-- Return only the file path when done, no explanation"""
+- Use the error and your judgement to determine what needs to change
+- Only use file paths from the "All project files" list — never invent names
+- Read any file you need with read_file before modifying it
+- Write fixes back with write_files
+- Use install_deps if packages are missing
+- Make the minimal change needed — do not change the overall goal
+- Return only the fixed file path when done, no explanation"""
 
 
 def _make_plan_agent(tools):
@@ -86,17 +93,34 @@ def _make_plan_agent(tools):
 
     async def plan_agent(state: State):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        workspace = f"./workspace/run_{run_id}"
+        # Reuse workspace across tool round-trips so the path doesn't change mid-plan
+        workspace = state.get("workspace") or f"./workspace/run_{run_id}"
+        logger.info("Planning task | workspace=%s | task=%r", workspace, state.get("task", ""))
         prompt = _PLAN_PROMPT.format(task=state.get("task", ""), workspace=workspace)
         response = await llm_with_search.ainvoke([HumanMessage(content=prompt)] + state["messages"])
-        raw = response.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
+
+        # Model is making a tool call — let the graph route to tools1 and come back
+        if response.tool_calls:
+            return {"messages": response, "workspace": workspace}
+
+        # content can be a list of blocks when tool use is involved
+        content = response.content
+        if isinstance(content, list):
+            raw = " ".join(
+                block["text"] for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            raw = content
+        # LLM sometimes wraps JSON in markdown code fences; strip them before parsing
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
         parsed = json.loads(raw)
-        return {"messages": response, 
-                "steps": parsed["steps"], 
+        logger.info("Plan created | files=%s | deps=%s", parsed["files"], parsed.get("dependencies", []))
+        return {"messages": response,
+                "steps": parsed["steps"],
                 "files": parsed["files"],
                 "file_path": parsed["entry_point"],
-                "workspace": workspace, 
+                "workspace": workspace,
                 "dependencies": parsed.get("dependencies", [])
                 }
 
@@ -110,9 +134,16 @@ def _make_code_agent(tools):
         workspace = state.get("workspace", "")
 
         if error:
-            code_tools = [t for t in tools if t.name in {"read_file", "write_files"}]
-            prompt = _DEBUGGER_PROMPT.format(error=error, workspace=workspace)
+            logger.warning("Debug mode | fixing error: %r", error[:120])
+            code_tools = [t for t in tools if t.name in {"read_file", "write_files", "install_deps", "list_files"}]
+            prompt = _DEBUGGER_PROMPT.format(
+                error=error,
+                workspace=workspace,
+                file_path=file_path,
+                files=state.get("files", []),
+            )
         else:
+            logger.info("Code mode | generating code for workspace=%s", workspace)
             code_tools = [t for t in tools if t.name in {"write_files"}]
             prompt = _CODER_PROMPT.format(
                 task=state.get("task", ""),
@@ -121,10 +152,21 @@ def _make_code_agent(tools):
                 workspace=workspace
             )
 
+        # Only pass the most recent tool call + result pair from this agent's own loop.
+        # Passing the full shared history would end with the planner's AIMessage,
+        # which violates Anthropic's "must end with user/tool message" constraint.
+        tool_context = []
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, ToolMessage):
+                tool_context.insert(0, msg)
+            elif hasattr(msg, "tool_calls") and msg.tool_calls:
+                tool_context.insert(0, msg)
+                break
+            else:
+                break
+
         llm_with_tools = llm.bind_tools(code_tools)
-        response = await llm_with_tools.ainvoke(
-            [HumanMessage(content=prompt)] + state["messages"]
-        )
+        response = await llm_with_tools.ainvoke([HumanMessage(content=prompt)] + tool_context)
         return {"messages": response}
 
     return code_agent
@@ -137,25 +179,59 @@ def _make_exec_agent(tools):
     async def exec_agent(state: State):
         retry_count = state.get("retry_count", 0)
         if retry_count >= 3:
+            logger.error("Max retry limit reached, aborting execution")
             return {"output": "Max Retry Limit Reached"}
 
-        # Install dependencies only on the first attempt
+        logger.info("Executing code | attempt=%d | file=%s", retry_count + 1, state.get("file_path", ""))
+
+        # Deps are installed once upfront; retries re-use whatever was already installed
         if retry_count == 0:
             deps = state.get("dependencies", [])
             if deps:
+                logger.info("Installing dependencies: %s", deps)
                 install_raw = await install_deps.ainvoke({"packages": deps})
                 install_result = json.loads(install_raw[0]["text"])
                 if not install_result["success"]:
+                    logger.error("Dependency install failed: %s", install_result["error"])
                     return {"error": f"dependency install failed: {install_result['error']}", "retry_count": retry_count + 1}
 
         raw = await run_code.ainvoke({"file_path": state.get("file_path", "")})
         try:
             result = json.loads(raw[0]["text"])
         except (IndexError, KeyError, json.JSONDecodeError) as e:
+            logger.error("Failed to parse executor result: %s", e)
             return {"error": f"executor failed to parse result: {e}", "retry_count": retry_count + 1}
 
         if result["success"]:
+            logger.info("Execution succeeded")
             return {"output": result["output"], "error": "", "success": True}
+        logger.warning("Execution failed | attempt=%d | error=%r", retry_count + 1, result["error"][:120])
         return {"error": result["error"], "retry_count": retry_count + 1}
 
     return exec_agent
+
+def _make_plan_review_node(tools):
+    async def plan_review(state: State):
+        decision = interrupt({
+            "task": state.get("task", ""),
+            "workspace": state.get("workspace", ""),
+            "steps": state.get("steps", ""),
+            "files": state.get("files", []),
+            "entry_point": state.get("file_path", ""),
+            "dependencies": state.get("dependencies", []),
+            "message": "Review the plan. Reply with action=approve to proceed, or action=reject with feedback to revise.",
+        })
+
+        action = decision.get("action", "approve")
+        feedback = decision.get("feedback", "").strip()
+
+        # Feedback flows back to the planner as a user message so it can revise
+        # the full plan (steps, files, entry_point, dependencies) itself rather
+        # than the human hand-editing structured fields.
+        if action == "reject" and feedback:
+            return {
+                "plan_decision": action,
+                "messages": [HumanMessage(content=f"The previous plan was rejected. Revise it based on this feedback:\n{feedback}")],
+            }
+        return {"plan_decision": action}
+    return plan_review
