@@ -42,11 +42,17 @@ app = FastAPI(lifespan=lifespan)
 
 class TaskRequest(BaseModel):
     task: str
+    # Client-generated thread id lets the frontend correlate /run with /resume
+    # without a round-trip. Falls back to a server-side UUID if omitted.
+    thread_id: str | None = None
 
-class ReviewRequest(BaseModel):
+class ResumeRequest(BaseModel):
     thread_id: str
-    action: str  # "approve" or "reject"
+    action: str  # "approve" | "reject" | "feedback"
     feedback: str = ""
+
+
+_VALID_ACTIONS = {"approve", "reject", "feedback"}
 
 
 def _format_result(result: dict, thread_id: str) -> dict:
@@ -57,7 +63,12 @@ def _format_result(result: dict, thread_id: str) -> dict:
         return {
             "status": "awaiting_review",
             "thread_id": thread_id,
-            "plan": plan,
+            "interrupt": {
+                "steps": plan.get("steps", ""),
+                "files": plan.get("files", []),
+                "dependencies": plan.get("dependencies", []),
+                "message": plan.get("message", ""),
+            },
         }
 
     success = result.get("success", False)
@@ -67,7 +78,7 @@ def _format_result(result: dict, thread_id: str) -> dict:
     else:
         logger.warning("Task failed | thread=%s | retries=%d | error=%r", thread_id, retries, result.get("error", ""))
     return {
-        "status": "complete",
+        "status": "done",
         "thread_id": thread_id,
         "output": result.get("output", ""),
         "error": result.get("error", ""),
@@ -78,7 +89,7 @@ def _format_result(result: dict, thread_id: str) -> dict:
 
 @app.post("/run")
 async def run_agent(request: TaskRequest):
-    thread_id = str(uuid4())
+    thread_id = request.thread_id or str(uuid4())
     logger.info("Task received | thread=%s | task=%r", thread_id, request.task)
     config = {"configurable": {"thread_id": thread_id}}
     result = await graph.ainvoke(
@@ -88,13 +99,19 @@ async def run_agent(request: TaskRequest):
     return _format_result(result, thread_id)
 
 
-@app.post("/review")
-async def review_plan(request: ReviewRequest):
+@app.post("/resume")
+async def resume_agent(request: ResumeRequest):
     action = request.action.lower()
-    if action not in {"approve", "reject"}:
-        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
-    if action == "reject" and not request.feedback.strip():
-        raise HTTPException(status_code=400, detail="feedback is required when rejecting")
+    if action not in _VALID_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="action must be 'approve', 'reject', or 'feedback'",
+        )
+    if action == "feedback" and not request.feedback.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="feedback is required when action is 'feedback'",
+        )
 
     logger.info("Plan review | thread=%s | action=%s", request.thread_id, action)
     config = {"configurable": {"thread_id": request.thread_id}}

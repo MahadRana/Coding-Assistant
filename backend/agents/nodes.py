@@ -219,19 +219,26 @@ def _make_plan_review_node(tools):
             "files": state.get("files", []),
             "entry_point": state.get("file_path", ""),
             "dependencies": state.get("dependencies", []),
-            "message": "Review the plan. Reply with action=approve to proceed, or action=reject with feedback to revise.",
+            "message": "Review the plan. action=approve to proceed, action=reject to try a different approach, or action=feedback with feedback text for targeted revisions.",
         })
 
         action = decision.get("action", "approve")
         feedback = decision.get("feedback", "").strip()
 
-        # Feedback flows back to the planner as a user message so it can revise
-        # the full plan (steps, files, entry_point, dependencies) itself rather
-        # than the human hand-editing structured fields.
-        if action == "reject" and feedback:
-            return {
-                "plan_decision": action,
-                "messages": [HumanMessage(content=f"The previous plan was rejected. Revise it based on this feedback:\n{feedback}")],
-            }
-        return {"plan_decision": action}
+        if action == "approve":
+            return {"plan_decision": "approve"}
+
+        # reject and feedback both loop back to the planner — the difference is
+        # only what we tell it. A bare reject is "try again with a different
+        # approach"; feedback carries specific revision guidance. Either way,
+        # the planner owns the rewrite rather than the human editing fields.
+        if action == "feedback" and feedback:
+            msg = f"The previous plan needs revision. Feedback:\n{feedback}"
+        else:
+            msg = "The previous plan was rejected. Take a different approach."
+
+        return {
+            "plan_decision": "revise",
+            "messages": [HumanMessage(content=msg)],
+        }
     return plan_review

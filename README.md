@@ -1,31 +1,68 @@
 # Coding Assistant
 
-An agentic coding assistant powered by Claude and LangGraph. Given a natural-language task, it plans, reviews, writes, and executes Python code in an isolated workspace — automatically retrying on errors, with a human-in-the-loop checkpoint between planning and coding.
+An agentic coding assistant powered by Claude and LangGraph, with a React frontend. Given a natural-language task, the agent plans, reviews (with human-in-the-loop), writes, and executes Python code in an isolated workspace — automatically retrying on errors.
+
+## Repo layout
+
+```
+coding_assistant/
+├── backend/          # FastAPI + LangGraph + MCP tool server
+│   ├── main.py
+│   ├── agents/
+│   │   ├── graph.py
+│   │   ├── nodes.py
+│   │   └── mcp_server.py
+│   ├── bruno/        # Bruno API collection
+│   ├── logs/         # app.log lives here (file-only logging)
+│   ├── workspace/    # Per-run isolated output directories
+│   ├── pyproject.toml
+│   └── .env
+└── frontend/         # React + Vite + TypeScript + Tailwind v4
+    ├── index.html
+    ├── package.json
+    ├── vite.config.ts
+    └── src/
+        ├── App.tsx
+        ├── api.ts
+        ├── types.ts
+        ├── hooks/useAgent.ts
+        └── components/
+            ├── TaskInput.tsx
+            ├── PlanReviewer.tsx
+            ├── OutputDisplay.tsx
+            └── StatusIndicator.tsx
+```
 
 ## How it works
 
 ```
 POST /run  →  Planner  →  Plan Reviewer  →  Coder  →  Executor
                 ↑ (web search)   ↑ (human approval)   ↑ (file I/O)   ↓ (success or error → debugger retry)
-                                  ↓ (reject + feedback)
+                                  ↓ (reject / feedback)
                                 Planner
 ```
 
 1. **Planner** – generates a step-by-step plan, decides which files to create, picks an entry point, and lists required dependencies. Can search the web (Tavily) for unfamiliar libraries.
-2. **Plan Reviewer** – pauses the graph and surfaces the plan for human approval via a LangGraph `interrupt`. The caller resumes the run through `POST /review` with `approve` or `reject` + feedback. Rejection loops back to the planner with the feedback as a new user message.
-3. **Coder** – writes all planned files to disk in one `write_files` call (multi-file support). In retry mode, it switches to a debugger prompt: reads the failing file and applies the minimal fix.
-4. **Executor** – installs declared dependencies on the first attempt (via `uv pip install`), runs the entry-point script with a 60s timeout, and returns stdout. Routes back to the coder on failure (up to 3 attempts).
+2. **Plan Reviewer** – pauses the graph and surfaces the plan for human approval via a LangGraph `interrupt`. The caller resumes the run through `POST /resume` with one of three actions: `approve`, `reject` (terse "try a different approach"), or `feedback` (revise with specific guidance). Reject and feedback both loop back to the planner.
+3. **Coder** – writes all planned files to disk in one `write_files` call (multi-file). In retry mode, switches to a debugger prompt: reads the failing file and applies the minimal fix.
+4. **Executor** – installs declared dependencies on the first attempt (`uv pip install`), runs the entry point with a 60s timeout, and returns stdout. Routes back to the coder on failure (up to 3 attempts).
 
-Each run lives in its own workspace at `./workspace/run_<timestamp>/` so files don't collide between runs. Graph state is checkpointed in memory and addressed by a `thread_id` so `/review` can resume the exact pending run.
+Each run lives in `backend/workspace/run_<timestamp>/`. Graph state is checkpointed in memory and addressed by a `thread_id` so `/resume` can target the exact pending run.
 
 ## Setup
 
-**Requirements:** Python 3.12+, [uv](https://github.com/astral-sh/uv)
+**Requirements:** Python 3.12+, [uv](https://github.com/astral-sh/uv), Node 20+.
+
+### Backend
 
 ```bash
+cd backend
 uv sync
-cp .env.example .env   # add your API keys (see below)
+cp .env.example .env   # add ANTHROPIC_API_KEY and TAVILY_API_KEY
+uv run uvicorn main:app --reload
 ```
+
+The API listens on `http://localhost:8000`.
 
 **.env keys required:**
 
@@ -34,71 +71,76 @@ ANTHROPIC_API_KEY=...
 TAVILY_API_KEY=...
 ```
 
-## Running
+### Frontend
 
 ```bash
-uv run uvicorn main:app --reload
+cd frontend
+npm install
+npm run dev
 ```
 
-The API is available at `http://localhost:8000`.
+Dev server at `http://localhost:5173`. `/run` and `/resume` are proxied to `:8000` via [vite.config.ts](frontend/vite.config.ts), so no CORS setup is needed.
 
 ## Logging
 
-All logs (FastAPI, agents, MCP tools) are written to [logs/app.log](logs/app.log). Nothing is written to the terminal — tail the file to follow along:
+All backend logs (FastAPI, agents, MCP tools, uvicorn) are written to [backend/logs/app.log](backend/logs/app.log). Nothing is written to the terminal:
 
 ```bash
-tail -f logs/app.log
+tail -f backend/logs/app.log
 ```
 
 ## API
 
 ### `POST /run`
 
-Submits a task. Returns either a plan awaiting review, or — if the planner short-circuits — a completed result.
-
 **Request**
 ```json
-{ "task": "Write a script that fetches the latest Bitcoin price and prints it" }
+{
+  "task": "Write a script that fetches the latest Bitcoin price and prints it",
+  "thread_id": "5f2c8a1d-..."
+}
 ```
+
+`thread_id` is optional — if omitted, the server generates one and returns it.
 
 **Response (plan awaiting review)**
 ```json
 {
   "status": "awaiting_review",
-  "thread_id": "5f2c…",
-  "plan": {
-    "task": "...",
-    "workspace": "./workspace/run_20260601_120000",
+  "thread_id": "5f2c8a1d-...",
+  "interrupt": {
     "steps": "1. ...\n2. ...",
     "files": ["./workspace/run_20260601_120000/main.py"],
-    "entry_point": "./workspace/run_20260601_120000/main.py",
     "dependencies": ["requests"],
-    "message": "Review the plan. Reply with action=approve to proceed, or action=reject with feedback to revise."
+    "message": "Review the plan. action=approve to proceed, action=reject to try a different approach, or action=feedback with feedback text for targeted revisions."
   }
 }
 ```
 
-### `POST /review`
+### `POST /resume`
 
 Resumes a paused run after a human has reviewed the plan.
 
 **Request**
 ```json
 {
-  "thread_id": "5f2c…",
-  "action": "approve",
-  "feedback": ""
+  "thread_id": "5f2c8a1d-...",
+  "action": "feedback",
+  "feedback": "Use httpx instead of requests"
 }
 ```
 
-- `action`: `"approve"` to proceed to the coder, or `"reject"` to send the plan back to the planner.
-- `feedback`: required when rejecting; flows back to the planner as a new user message.
+| Action | Behavior |
+|---|---|
+| `approve` | Proceed to the coder. |
+| `reject` | Loop back to the planner with a "try a different approach" message. `feedback` is ignored. |
+| `feedback` | Loop back to the planner with the provided feedback. `feedback` is required. |
 
 **Response (complete)**
 ```json
 {
-  "status": "complete",
-  "thread_id": "5f2c…",
+  "status": "done",
+  "thread_id": "5f2c8a1d-...",
   "output": "Bitcoin price: $67,423.00\n",
   "error": "",
   "file_path": "./workspace/run_20260601_120000/main.py",
@@ -108,31 +150,16 @@ Resumes a paused run after a human has reviewed the plan.
 
 | Field | Description |
 |---|---|
-| `status` | `awaiting_review` or `complete` |
-| `thread_id` | identifier used to resume the run via `/review` |
+| `status` | `awaiting_review` or `done` |
+| `thread_id` | identifier used to resume the run via `/resume` |
 | `output` | stdout of the generated script |
 | `error` | last error message if execution failed after all retries |
 | `file_path` | entry-point file that was run |
 | `retry_count` | number of fix-and-retry cycles (max 3) |
 
-## Project structure
-
-```
-coding_assistant/
-├── main.py                  # FastAPI app, lifespan, /run and /review endpoints, logging setup
-├── agents/
-│   ├── graph.py             # LangGraph workflow + routing
-│   ├── nodes.py             # Planner, plan-reviewer, coder/debugger, executor nodes
-│   └── mcp_server.py        # MCP tool server (run_code, read_file, write_files, list_files, install_deps, search_web)
-├── bruno/                   # Bruno API collection for hitting /run and /review
-├── logs/                    # app.log lives here (file-only logging)
-├── workspace/               # Per-run isolated output directories
-├── pyproject.toml
-└── .env
-```
-
 ## Dependencies
 
+### Backend
 | Package | Purpose |
 |---|---|
 | `langchain-anthropic` | Claude LLM integration |
@@ -141,3 +168,12 @@ coding_assistant/
 | `langchain-tavily` | Web search via Tavily |
 | `fastapi` + `uvicorn` | HTTP API server |
 | `mcp` | MCP server for sandboxed tool execution |
+
+### Frontend
+| Package | Purpose |
+|---|---|
+| `react` + `react-dom` | UI |
+| `vite` + `@vitejs/plugin-react` | Dev server + build |
+| `tailwindcss` + `@tailwindcss/vite` | Styling (Tailwind v4) |
+| `axios` | HTTP client |
+| `typescript` | Types |

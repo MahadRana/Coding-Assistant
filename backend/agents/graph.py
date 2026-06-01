@@ -32,7 +32,7 @@ def _route_planner(state: State):
     return "plan_reviewer"
 
 def _route_plan_reviewer(state: State):
-    if state.get("plan_decision") == "reject":
+    if state.get("plan_decision") == "revise":
         return "planner"
     return "coder"
 
