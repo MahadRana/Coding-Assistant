@@ -1,5 +1,5 @@
+import asyncio
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,32 +15,52 @@ mcp = FastMCP("Tools")
 _tavily = TavilySearch(max_results=3)
 
 
+async def _run_subprocess(cmd: list[str], *, cwd: str | None = None, timeout: float):
+    """Run a subprocess without blocking the event loop.
+
+    Returns (returncode, stdout, stderr). Raises asyncio.TimeoutError on timeout,
+    after killing the child so it can't outlive the call.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise
+    return process.returncode, stdout.decode(), stderr.decode()
+
+
 @mcp.tool()
-def search_web(query: str) -> str:
+async def search_web(query: str) -> str:
     """Search Web for information"""
     logger.info("search_web | query=%r", query)
-    results = _tavily.invoke(query)
+    results = await _tavily.ainvoke(query)
     return str(results)
 
 
 @mcp.tool()
-def run_code(file_path: str):
+async def run_code(file_path: str):
     logger.info("run_code | file=%s", file_path)
     try:
         p = Path(file_path)
         # Run the script in its own directory so relative imports and file references resolve correctly.
-        # Timeout of 10s prevents runaway or infinite-loop generated code from hanging the agent.
-        process = subprocess.run(
-            [sys.executable, p.name],
-            capture_output=True, text=True, timeout=60, cwd=str(p.parent)
+        # Timeout of 60s prevents runaway or infinite-loop generated code from hanging the agent.
+        returncode, stdout, stderr = await _run_subprocess(
+            [sys.executable, p.name], cwd=str(p.parent), timeout=60
         )
-        if process.returncode == 0:
+        if returncode == 0:
             logger.info("run_code succeeded | file=%s", file_path)
-            return {"success": True, "output": str(process.stdout)}
+            return {"success": True, "output": str(stdout)}
         else:
-            logger.warning("run_code failed | file=%s | stderr=%r", file_path, process.stderr[:200])
-            return {"success": False, "error": str(process.stderr)}
-    except subprocess.TimeoutExpired:
+            logger.warning("run_code failed | file=%s | stderr=%r", file_path, stderr[:200])
+            return {"success": False, "error": str(stderr)}
+    except asyncio.TimeoutError:
         logger.warning("run_code timed out | file=%s", file_path)
         return {"success": False, "error": "code timed out"}
     except Exception as e:
@@ -48,37 +68,49 @@ def run_code(file_path: str):
         return {"success": False, "error": str(e)}
 
 
+def _read_file_sync(file_path: str) -> str:
+    with open(file_path, "r") as file:
+        return file.read()
+
+
 @mcp.tool()
-def read_file(file_path: str):
+async def read_file(file_path: str):
     logger.info("read_file | file=%s", file_path)
     try:
-        with open(file_path, "r") as file:
-            data = file.read()
+        data = await asyncio.to_thread(_read_file_sync, file_path)
         return {"success": True, "data": data}
     except Exception as e:
         logger.error("read_file error | file=%s | %s", file_path, e)
         return {"success": False, "error": str(e)}
 
 
+def _write_files_sync(files: dict):
+    for file_path, content in files.items():
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "w") as file:
+            file.write(content)
+
+
 @mcp.tool()
-def write_files(files: dict):
+async def write_files(files: dict):
     logger.info("write_files | paths=%s", list(files.keys()))
     try:
-        for file_path, content in files.items():
-            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(file_path, "w") as file:
-                file.write(content)
+        await asyncio.to_thread(_write_files_sync, files)
         return {"success": True}
     except Exception as e:
         logger.error("write_files error | %s", e)
         return {"success": False, "error": str(e)}
 
 
+def _list_files_sync(directory: str) -> list[str]:
+    path = Path(directory)
+    return [str(f) for f in path.iterdir() if f.is_file()]
+
+
 @mcp.tool()
-def list_files(directory: str):
+async def list_files(directory: str):
     try:
-        path = Path(directory)
-        files = [str(f) for f in path.iterdir() if f.is_file()]
+        files = await asyncio.to_thread(_list_files_sync, directory)
         return {"success": True, "files": files}
     except Exception as e:
         logger.error("list_files error | dir=%s | %s", directory, e)
@@ -86,19 +118,19 @@ def list_files(directory: str):
 
 
 @mcp.tool()
-def install_deps(packages: list):
+async def install_deps(packages: list):
     logger.info("install_deps | packages=%s", packages)
     try:
-        process = subprocess.run(
+        returncode, _stdout, stderr = await _run_subprocess(
             ["uv", "pip", "install", "--python", sys.executable, *packages],
-            capture_output=True, text=True, timeout=120
+            timeout=120,
         )
-        if process.returncode == 0:
+        if returncode == 0:
             logger.info("install_deps succeeded | packages=%s", packages)
             return {"success": True}
-        logger.warning("install_deps failed | packages=%s | stderr=%r", packages, process.stderr[:200])
-        return {"success": False, "error": process.stderr}
-    except subprocess.TimeoutExpired:
+        logger.warning("install_deps failed | packages=%s | stderr=%r", packages, stderr[:200])
+        return {"success": False, "error": stderr}
+    except asyncio.TimeoutError:
         logger.warning("install_deps timed out | packages=%s", packages)
         return {"success": False, "error": "pip install timed out"}
     except Exception as e:
