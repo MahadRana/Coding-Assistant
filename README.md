@@ -6,18 +6,22 @@ An agentic coding assistant powered by Claude and LangGraph, with a React fronte
 
 ```
 coding_assistant/
+├── docker-compose.yaml  # Runs backend (with healthcheck) then frontend
 ├── backend/          # FastAPI + LangGraph + MCP tool server
+│   ├── Dockerfile
 │   ├── main.py
 │   ├── agents/
 │   │   ├── graph.py
 │   │   ├── nodes.py
 │   │   └── mcp_server.py
 │   ├── bruno/        # Bruno API collection
-│   ├── logs/         # app.log lives here (file-only logging)
+│   ├── logs/         # app.log lives here
 │   ├── workspace/    # Per-run isolated output directories
 │   ├── pyproject.toml
 │   └── .env
 └── frontend/         # React + Vite + TypeScript + Tailwind v4
+    ├── Dockerfile    # Multi-stage build → nginx serves the static bundle
+    ├── nginx.conf    # SPA + proxies /run and /resume to the backend
     ├── index.html
     ├── package.json
     ├── vite.config.ts
@@ -47,9 +51,29 @@ POST /run  →  Planner  →  Plan Reviewer  →  Coder  →  Executor
 3. **Coder** – writes all planned files to disk in one `write_files` call (multi-file). In retry mode, switches to a debugger prompt: reads the failing file and applies the minimal fix.
 4. **Executor** – installs declared dependencies on the first attempt (`uv pip install`), runs the entry point with a 60s timeout, and returns stdout. Routes back to the coder on failure (up to 3 attempts).
 
-Each run lives in `backend/workspace/run_<timestamp>/`. Graph state is checkpointed in memory and addressed by a `thread_id` so `/resume` can target the exact pending run.
+Each run lives in `backend/workspace/run_<timestamp>/`. Graph state is checkpointed to an on-disk SQLite store (`backend/checkpoints.sqlite`, via `langgraph-checkpoint-sqlite`) and addressed by a `thread_id` so `/resume` can target the exact pending run — and paused runs survive a backend restart.
 
-## Setup
+## Quickstart (Docker)
+
+The fastest way to run the whole stack. **Requires** Docker with Compose v2 and a `backend/.env` file (see [keys below](#backend)).
+
+```bash
+cp backend/.env.example backend/.env   # add ANTHROPIC_API_KEY and TAVILY_API_KEY
+docker compose up --build
+```
+
+Compose starts the **backend first**, waits for its healthcheck to pass, then starts the **frontend**:
+
+| Service | URL | Notes |
+|---|---|---|
+| Frontend | `http://localhost:5173` | nginx serving the built bundle; proxies `/run` and `/resume` to the backend |
+| Backend | `http://localhost:8000` | FastAPI; `/docs` for the OpenAPI UI |
+
+Secrets are read from `backend/.env` (never baked into the image). Generated projects persist in the `backend_workspace` volume. Tear down with `docker compose down` (add `-v` to also drop the workspace volume).
+
+> The agent checkpoint DB lives inside the backend container and is **not** persisted across `docker compose down`. Paused (`awaiting_review`) runs survive a container restart but not a full teardown.
+
+## Setup (local, without Docker)
 
 **Requirements:** Python 3.12+, [uv](https://github.com/astral-sh/uv), Node 20+.
 
@@ -83,11 +107,13 @@ Dev server at `http://localhost:5173`. `/run` and `/resume` are proxied to `:800
 
 ## Logging
 
-All backend logs (FastAPI, agents, MCP tools, uvicorn) are written to [backend/logs/app.log](backend/logs/app.log). Nothing is written to the terminal:
+All backend logs (FastAPI, agents, MCP tools, uvicorn) are written to [backend/logs/app.log](backend/logs/app.log) **and** mirrored to the terminal (stderr). Follow the file with:
 
 ```bash
 tail -f backend/logs/app.log
 ```
+
+Under Docker, the same output is visible via `docker compose logs -f backend`.
 
 ## API
 
@@ -164,6 +190,7 @@ Resumes a paused run after a human has reviewed the plan.
 |---|---|
 | `langchain-anthropic` | Claude LLM integration |
 | `langgraph` | Agent workflow orchestration + `interrupt` for human review |
+| `langgraph-checkpoint-sqlite` | On-disk checkpointing so paused runs survive restarts |
 | `langchain-mcp-adapters` | Connects LangGraph to the MCP tool server |
 | `langchain-tavily` | Web search via Tavily |
 | `fastapi` + `uvicorn` | HTTP API server |
