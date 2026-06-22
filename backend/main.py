@@ -19,7 +19,10 @@ logging.basicConfig(
     level=logging.INFO,
     format=_fmt,
     datefmt=_datefmt,
-    handlers=[logging.FileHandler(_LOG_DIR / "app.log")],
+    handlers=[
+        logging.FileHandler(_LOG_DIR / "app.log"),
+        logging.StreamHandler(),  # mirror to the terminal so startup/requests are visible
+    ],
 )
 # Silence uvicorn's default stdout/stderr handlers so logs only land in the file.
 for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
@@ -34,9 +37,11 @@ graph = None
 async def lifespan(app: FastAPI):
     global graph
     logger.info("Building agent graph...")
-    graph = await build_graph()
-    logger.info("Agent graph ready")
-    yield
+    async with build_graph() as g:
+        graph = g
+        logger.info("Agent graph ready")
+        yield
+        graph = None
 
 app = FastAPI(lifespan=lifespan)
 

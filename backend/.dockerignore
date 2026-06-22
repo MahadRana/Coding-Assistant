@@ -1,0 +1,14 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.python-version
+.env
+logs
+workspace
+checkpoints.sqlite
+bruno
+.git
+.gitignore
+Dockerfile
+.dockerignore
