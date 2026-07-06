@@ -29,6 +29,10 @@ async def _planner_subgraph():
     workflow.add_conditional_edges(
         "planner", _route_planner, {"tools1": "tools1", "plan_reviewer": "plan_reviewer"}
     )
+    # After a web search, return to the planner so it can fold the result into
+    # the plan (mirrors tools -> coder in the executor subgraph). Without this
+    # edge the subgraph dead-ends after a search, skipping the review interrupt.
+    workflow.add_edge("tools1", "planner")
     workflow.add_conditional_edges(
         "plan_reviewer", _route_plan_reviewer, {END: END, "planner": "planner"}
     )

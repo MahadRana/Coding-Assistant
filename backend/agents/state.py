@@ -19,6 +19,7 @@ class State(MessagesState):
     retry_count: int
     output: str
     success: bool
+    deps_installed: bool
 
 
 class PlannerState(MessagesState):
@@ -53,3 +54,4 @@ class ExecutorState(MessagesState):
     retry_count: int
     output: str
     success: bool
+    deps_installed: bool

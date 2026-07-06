@@ -42,9 +42,20 @@ def _make_plan_agent(tools):
             )
         else:
             raw = content
-        # LLM sometimes wraps JSON in markdown code fences; strip them before parsing
+        # The model sometimes wraps the JSON in markdown fences and, especially
+        # after a web search, prefixes it with explanatory prose ("Here is the
+        # plan: {...}") despite the prompt. Slice from the first { to the last }
+        # so json.loads sees only the object; fall back to the raw string (and a
+        # clear error) if no braces are present.
         raw = raw.strip().replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(raw)
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            raw = raw[start:end + 1]
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse plan JSON | raw=%r", raw[:500])
+            raise
         logger.info("Plan created | files=%s | deps=%s", parsed["files"], parsed.get("dependencies", []))
         return {"messages": response,
                 "steps": parsed["steps"],
@@ -148,28 +159,33 @@ def _make_exec_agent(tools):
 
         logger.info("Executing code | attempt=%d | file=%s", retry_count + 1, state.get("file_path", ""))
 
-        # Deps are installed once upfront; retries re-use whatever was already installed
-        if retry_count == 0:
-            deps = state.get("dependencies", [])
-            if deps:
-                logger.info("Installing dependencies: %s", deps)
-                install_raw = await install_deps.ainvoke({"packages": deps})
-                install_result = json.loads(install_raw[0]["text"])
-                if not install_result["success"]:
-                    logger.error("Dependency install failed: %s", install_result["error"])
-                    return {"error": f"dependency install failed: {install_result['error']}", "retry_count": retry_count + 1}
+        # Install deps until it succeeds once, tracked by the deps_installed flag
+        # rather than retry_count: a failed install must be retried on later passes,
+        # not skipped forever after attempt 0 (which would burn the whole retry
+        # budget on run_code failing with missing packages). deps_installed rides
+        # along in the return dict so a successful install survives subsequent passes.
+        installed_now = {}
+        deps = state.get("dependencies", [])
+        if deps and not state.get("deps_installed", False):
+            logger.info("Installing dependencies: %s", deps)
+            install_raw = await install_deps.ainvoke({"packages": deps})
+            install_result = json.loads(install_raw[0]["text"])
+            if not install_result["success"]:
+                logger.error("Dependency install failed: %s", install_result["error"])
+                return {"error": f"dependency install failed: {install_result['error']}", "retry_count": retry_count + 1}
+            installed_now = {"deps_installed": True}
 
         raw = await run_code.ainvoke({"file_path": state.get("file_path", "")})
         try:
             result = json.loads(raw[0]["text"])
         except (IndexError, KeyError, json.JSONDecodeError) as e:
             logger.error("Failed to parse executor result: %s", e)
-            return {"error": f"executor failed to parse result: {e}", "retry_count": retry_count + 1}
+            return {"error": f"executor failed to parse result: {e}", "retry_count": retry_count + 1, **installed_now}
 
         if result["success"]:
             logger.info("Execution succeeded")
-            return {"output": result["output"], "error": "", "success": True}
+            return {"output": result["output"], "error": "", "success": True, **installed_now}
         logger.warning("Execution failed | attempt=%d | error=%r", retry_count + 1, result["error"][:120])
-        return {"error": result["error"], "retry_count": retry_count + 1}
+        return {"error": result["error"], "retry_count": retry_count + 1, **installed_now}
 
     return exec_agent
